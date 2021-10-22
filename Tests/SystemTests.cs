@@ -16,9 +16,9 @@ namespace Tests
 {
     public static class TestExtensions
     {
-        public static ReadOnlySequence<byte> AsReadonlySequence(this string s)
+        public static ReadOnlyMemory<byte> AsReadOnlyMemory(this string s)
         {
-            return new ReadOnlySequence<byte>(Encoding.UTF8.GetBytes(s));
+            return Encoding.UTF8.GetBytes(s);
         }
     }
     public class SystemTests
@@ -99,7 +99,7 @@ namespace Tests
                             testPassed.SetResult(false);
                     }
                 });
-            var readonlySequence = "apple".AsReadonlySequence();
+            var readonlySequence = "apple".AsReadOnlyMemory();
             var message = new Message(new Data(readonlySequence));
             await producer.Send(1, message);
             Assert.True(testPassed.Task.Wait(5000));
@@ -132,7 +132,7 @@ namespace Tests
                         await Task.CompletedTask;
                     }
                 });
-            var msgData = new Data("apple".AsReadonlySequence());
+            var msgData = new Data("apple".AsReadOnlyMemory());
             var message = new Message(msgData);
             await producer.Send(1, message);
             //wait for sent message to be delivered

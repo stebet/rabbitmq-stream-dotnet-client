@@ -14,8 +14,8 @@ namespace RabbitMQ.Stream.Client
 
         public MessageContext(ulong offset, TimeSpan timestamp)
         {
-            this.Offset = offset;
-            this.Timestamp = timestamp;
+            Offset = offset;
+            Timestamp = timestamp;
         }
     }
     
@@ -74,7 +74,7 @@ namespace RabbitMQ.Stream.Client
                 });
             if (response.Code == ResponseCode.Ok)
             {
-                this.subscriberId = consumerId;
+                subscriberId = consumerId;
                 return;
             }
             

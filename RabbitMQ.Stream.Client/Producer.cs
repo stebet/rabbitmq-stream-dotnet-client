@@ -24,7 +24,6 @@ namespace RabbitMQ.Stream.Client
 
     public class Producer
     {
-        private readonly Client client;
         private byte publisherId;
         private readonly ProducerConfig config;
         private readonly Channel<OutgoingMsg> messageBuffer;
@@ -37,18 +36,18 @@ namespace RabbitMQ.Stream.Client
 
         private Producer(Client client, ProducerConfig config)
         {
-            this.client = client;
+            Client = client;
             this.config = config;
-            this.messageBuffer = Channel.CreateBounded<OutgoingMsg>(new BoundedChannelOptions(10000) { AllowSynchronousContinuations = false, SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.Wait });
-            this.publishTask = Task.Run(ProcessBuffer);
-            this.semaphore = new(config.MaxInFlight, config.MaxInFlight);
+            messageBuffer = Channel.CreateBounded<OutgoingMsg>(new BoundedChannelOptions(10000) { AllowSynchronousContinuations = false, SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.Wait });
+            publishTask = Task.Run(ProcessBuffer);
+            semaphore = new(config.MaxInFlight, config.MaxInFlight);
         }
 
-        public Client Client => client;
+        public Client Client { get; }
 
         private async Task Init()
         {
-            var (pubId, response) = await client.DeclarePublisher(
+            var (pubId, response) = await Client.DeclarePublisher(
                 config.Reference,
                 config.Stream,
                 publishingIds =>
@@ -78,7 +77,7 @@ namespace RabbitMQ.Stream.Client
                     semaphore.Release(errors.Length);
                 });
 
-            this.publisherId = pubId;
+            publisherId = pubId;
         }
 
         public async ValueTask Send(ulong publishingId, Message message)
@@ -127,7 +126,7 @@ namespace RabbitMQ.Stream.Client
 
             async Task SendMessages(List<(ulong, Message)> messages)
             {
-                var publishTask = client.Publish(new Publish(publisherId, messages));
+                var publishTask = Client.Publish(new Publish(publisherId, messages));
                 if (!publishTask.IsCompletedSuccessfully)
                 {
                     await publishTask.ConfigureAwait(false);

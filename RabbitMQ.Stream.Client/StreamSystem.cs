@@ -123,10 +123,7 @@ namespace RabbitMQ.Stream.Client
         public static LeaderLocator Random => new LeaderLocator("random");
         public static LeaderLocator LeastLeaders => new LeaderLocator("least-leaders");
 
-        public override string ToString()
-        {
-            return value;
-        }
+        public override string ToString() => value;
     }
 
     public class StreamSystemInitialisationException : Exception

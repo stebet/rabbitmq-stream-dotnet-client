@@ -4,17 +4,17 @@ using System.Collections.Generic;
 
 namespace RabbitMQ.Stream.Client
 {
-    public readonly struct Publish : ICommand
+    public readonly struct Publish : IClientCommand
     {
-        private const ushort Key = 2;
-        public byte Version => 1;
+        public CommandKey Key => CommandKey.Publish;
+        public ushort Version => 1;
 
         public int SizeNeeded
         {
             get
             {
-                var size = 9; // pre amble 
-                foreach (var (_, msg) in messages)
+                var size = 5; // pre amble 
+                foreach (var (_, msg) in Messages)
                 {
                     size += 8 + 4 + msg.Size;
                 }
@@ -23,25 +23,22 @@ namespace RabbitMQ.Stream.Client
              }
         }
 
-        private readonly byte publisherId;
-        private readonly List<(ulong, Message)> messages;
-        public int MessageCount { get; }
+        public byte PublisherId { get; }
+        public List<(ulong, Message)> Messages { get; }
 
         public Publish(byte publisherId, List<(ulong, Message)> messages)
         {
-            this.publisherId = publisherId;
-            this.messages = messages;
-            this.MessageCount = messages.Count;
+            PublisherId = publisherId;
+            Messages = messages;
         }
 
         public int Write(Span<byte> span)
         {
-            var offset = WireFormatting.WriteUInt16(span, Key);
-            offset += WireFormatting.WriteUInt16(span.Slice(offset), Version);
-            offset += WireFormatting.WriteByte(span.Slice(offset), publisherId);
+            WireFormatting.WriteByte(span, PublisherId);
             // this assumes we never write an empty publish frame
-            offset += WireFormatting.WriteInt32(span.Slice(offset), MessageCount);
-            foreach(var (publishingId, msg) in messages)
+            WireFormatting.WriteInt32(span.Slice(1), Messages.Count);
+            int offset = 5;
+            foreach(var (publishingId, msg) in Messages)
             {
                 offset += WireFormatting.WriteUInt64(span.Slice(offset), publishingId);
                 // this only write "simple" messages, we assume msg is just the binary body

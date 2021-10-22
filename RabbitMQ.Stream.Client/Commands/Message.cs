@@ -6,25 +6,22 @@ namespace RabbitMQ.Stream.Client
 {
     public readonly struct Message
     {
-        private readonly Properties properties;
+        public Properties Properties { get; }
         
-        public Message(byte[] data) : this(new Data(new ReadOnlySequence<byte>(data)))
+        public Message(Memory<byte> data) : this(new Data(data))
         {
         }
 
         public Message(Data data, Properties properties = new Properties())
         {
-            this.Data = data;
-            this.properties = properties;
+            Data = data;
+            Properties = properties;
         }
 
         public Data Data { get; }
         public int Size => Data.Size;
 
-        public int Write(Span<byte> span)
-        {
-            return Data.Write(span);
-        }
+        public int Write(Span<byte> span) => Data.Write(span);
 
         public ReadOnlySequence<byte> Serialize()
         {
@@ -34,7 +31,7 @@ namespace RabbitMQ.Stream.Client
             return new ReadOnlySequence<byte>(data);
         }
 
-        public static Message From(ReadOnlySequence<byte> amqpData)
+        public static Message From(ReadOnlyMemory<byte> amqpData)
         {
             //parse AMQP encoded data
             var data = AMQP.Data.Parse(amqpData);

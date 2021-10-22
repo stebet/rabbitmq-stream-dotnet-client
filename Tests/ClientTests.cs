@@ -47,7 +47,7 @@ namespace Tests
             var response = await client.CreateStream(stream, new Dictionary<string, string>());
             Assert.Equal(ResponseCode.Ok, response.ResponseCode);
             var metaDataResponse = await client.QueryMetadata(new[] { stream });
-            Assert.Equal(1, metaDataResponse.StreamInfos.Count);
+            Assert.Single(metaDataResponse.StreamInfos);
             var streamInfoPair = metaDataResponse.StreamInfos.First();
             Assert.Equal(stream, streamInfoPair.Key);
             var streamInfo = streamInfoPair.Value;

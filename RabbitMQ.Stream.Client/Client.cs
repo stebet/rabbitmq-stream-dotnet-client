@@ -15,31 +15,9 @@ using System.Threading.Tasks.Sources;
 
 namespace RabbitMQ.Stream.Client
 {
-    internal static class TaskExtensions
-    {
-        public static async Task TimeoutAfter(this Task task, TimeSpan timeout)
-        {
-            if (task == await Task.WhenAny(task, Task.Delay(timeout)).ConfigureAwait(false))
-            {
-                await task.ConfigureAwait(false);
-            }
-            else
-            {
-                var supressErrorTask = task.ContinueWith((t, s) =>
-                {
-                    t.Exception?.Handle(e => true);
-                },
-                    null,
-                    CancellationToken.None,
-                    TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-                    TaskScheduler.Default);
-                throw new TimeoutException();
-            }
-        }
-    }
     public record ClientParameters
     {
-        public IDictionary<string, string> Properties { get; } =
+        public Dictionary<string, string> Properties { get; } =
             new Dictionary<string, string>
             {
                 {"product", "RabbitMQ Stream"},
@@ -55,28 +33,17 @@ namespace RabbitMQ.Stream.Client
         public Action<Exception> UnhandledExceptionHandler { get; set; } = _ => { };
     }
 
-    public readonly struct OutgoingMsg : ICommand
+    public readonly struct OutgoingMsg
     {
-        private readonly byte publisherId;
-        private readonly ulong publishingId;
-        private readonly Message data;
+        public byte PublisherId { get; }
+        public ulong PublishingId { get; }
+        public Message Data { get; }
 
         public OutgoingMsg(byte publisherId, ulong publishingId, Message data)
         {
-            this.publisherId = publisherId;
-            this.publishingId = publishingId;
-            this.data = data;
-        }
-
-        public byte PublisherId => publisherId;
-
-        public ulong PublishingId => publishingId;
-
-        public Message Data => data;
-        public int SizeNeeded => 0;
-        public int Write(Span<byte> span)
-        {
-            throw new NotImplementedException();
+            PublisherId = publisherId;
+            PublishingId = publishingId;
+            Data = data;
         }
     }
     
@@ -89,25 +56,18 @@ namespace RabbitMQ.Stream.Client
         private readonly IDictionary<byte, (Action<ReadOnlyMemory<ulong>>, Action<(ulong, ResponseCode)[]>)> publishers =
             new ConcurrentDictionary<byte, (Action<ReadOnlyMemory<ulong>>, Action<(ulong, ResponseCode)[]>)>();
         private readonly ConcurrentDictionary<uint, IValueTaskSource> requests = new();
-        private TaskCompletionSource<TuneResponse> tuneReceived = new TaskCompletionSource<TuneResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource<Tune> tuneReceived = new TaskCompletionSource<Tune>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private byte nextSubscriptionId;
         private readonly IDictionary<byte, Func<Deliver, Task>> consumers = new ConcurrentDictionary<byte, Func<Deliver, Task>>();
 
         private object closeResponse;
-        private readonly Task outgoingTask;
-        private readonly Task incomingTask;
-        private int publishCommandsSent;
+        public int PublishCommandsSent { get; private set; }
 
-        public int PublishCommandsSent => publishCommandsSent;
+        public int MessagesSent { get; private set; }
 
-        public int MessagesSent => messagesSent;
-
-        private int messagesSent;
-        private int confirmFrames;
-
-        public int ConfirmFrames => confirmFrames;
-        public int IncomingFrames => this.connection.NumFrames;
+        public int ConfirmFrames { get; private set; }
+        public int IncomingFrames => connection.NumFrames;
         //public int IncomingChannelCount => this.incoming.Reader.Count;
 
         public bool IsClosed => closeResponse != null;
@@ -147,7 +107,7 @@ namespace RabbitMQ.Stream.Client
 
             //tune
             var tune = await client.tuneReceived.Task;
-            await client.Publish(new TuneRequest(0, 0));
+            await client.Publish(new Tune(0, 0));
             
             // open 
             var open = await client.Request<OpenRequest, OpenResponse>(corr => new OpenRequest(corr, "/"));
@@ -167,14 +127,14 @@ namespace RabbitMQ.Stream.Client
                 await publishTask.ConfigureAwait(false);
             }
 
-            this.publishCommandsSent += 1;
-            this.messagesSent += publishMsg.MessageCount;
+            PublishCommandsSent += 1;
+            MessagesSent += publishMsg.Messages.Count;
             return publishTask.Result;
         }
 
-        public ValueTask<bool> Publish<T>(T msg) where T : struct, ICommand
+        public ValueTask<bool> Publish<T>(T msg) where T : struct, IClientCommand
         {
-            return this.connection.Write(msg);
+            return connection.Write(msg);
         }
 
         public async Task<(byte, DeclarePublisherResponse)> DeclarePublisher(string publisherRef,
@@ -214,12 +174,12 @@ namespace RabbitMQ.Stream.Client
             return result;
         }
 
-        private async ValueTask<TOut> Request<TIn, TOut>(Func<uint, TIn> request, int timeout = 10000) where TIn : struct, ICommand where TOut : struct, ICommand
+        private async ValueTask<TOut> Request<TIn, TOut>(Func<uint, TIn> request, int timeout = 10000) where TIn : struct, ICommandRequest where TOut : struct, ICommandResponse
         {
             var corr = NextCorrelationId();
             var tcs = PooledTaskSource<TOut>.Rent();
             requests.TryAdd(corr, tcs);
-            await Publish(request(corr));
+            await Publish(request(corr)).ConfigureAwait(false);
             using (CancellationTokenSource cts = new CancellationTokenSource(timeout))
             {
                 using (cts.Token.Register(valueTaskSource => ((ManualResetValueTaskSource<TOut>)valueTaskSource).SetException(new TimeoutException()), tcs))
@@ -237,113 +197,116 @@ namespace RabbitMQ.Stream.Client
             return Interlocked.Increment(ref correlationId);
         }
 
-        private async Task HandleIncoming(Memory<byte> frameMemory)
+        private Task HandleIncoming(ReadOnlyMemory<byte> frameMemory)
         {
-            var frame = new ReadOnlySequence<byte>(frameMemory);
-            WireFormatting.ReadUInt16(frame, out ushort tag);
-            if ((tag & 0x8000) != 0)
-            {
-                tag = (ushort)(tag ^ 0x8000);
-            }
-
-            switch (tag)
-            {
-                case PublishConfirm.Key:
-                    PublishConfirm.Read(frame, out PublishConfirm confirm);
-                    this.confirmFrames += 1;
-                    var (confirmCallback, _) = publishers[confirm.PublisherId];
-                    confirmCallback(confirm.PublishingIds);
-                    if (MemoryMarshal.TryGetArray(confirm.PublishingIds, out ArraySegment<ulong> confirmSegment))
-                    {
-                        ArrayPool<ulong>.Shared.Return(confirmSegment.Array);
-                    }
-                    break;
-                case Deliver.Key:
-                    Deliver.Read(frame, out Deliver deliver);
-                    var deliverHandler = consumers[deliver.SubscriptionId];
-                    await deliverHandler(deliver).ConfigureAwait(false);
-                    break;
-                case PublishError.Key:
-                    PublishError.Read(frame, out PublishError error);
-                    var (_, errorCallback) = publishers[error.PublisherId];
-                    errorCallback(error.PublishingErrors);
-                    break;
-                case MetaDataUpdate.Key:
-                    MetaDataUpdate.Read(frame, out MetaDataUpdate metaDataUpdate);
-                    parameters.MetadataHandler(metaDataUpdate);
-                    break;
-                case TuneResponse.Key:
-                    TuneResponse.Read(frame, out TuneResponse tuneResponse);
-                    tuneReceived.SetResult(tuneResponse);
-                    break;
-                default:
-                    HandleCorrelatedCommand(tag, ref frame);
-                    break;
-            }
-
-            if(MemoryMarshal.TryGetArray(frameMemory, out ArraySegment<byte> segment))
-            {
-                ArrayPool<byte>.Shared.Return(segment.Array);
-            }
+            WireFormatting.ReadUInt32(frameMemory.Span, out uint header);
+            bool isResponse = ((header >> 16) & 0b1000_0000_0000_0000) > 0;
+            CommandKey command = (CommandKey)((header >> 16) & 0b0111_1111_1111_1111);
+            return isResponse ? HandleResponse(command, ref frameMemory) : HandleCommand(command, ref frameMemory);
         }
 
-        private void HandleCorrelatedCommand(ushort tag, ref ReadOnlySequence<byte> frame)
+        private Task HandleCommand(CommandKey command, ref ReadOnlyMemory<byte> frameMemory)
         {
-            switch(tag)
+            if (command == CommandKey.Deliver)
             {
-                case DeclarePublisherResponse.Key:
+                Deliver.Read(ref frameMemory, out Deliver deliver);
+                var deliverHandler = consumers[deliver.SubscriptionId];
+                return deliverHandler(deliver);
+            }
+            else
+            {
+                var frame = new ReadOnlySequence<byte>(frameMemory);
+                switch (command)
+                {
+                    case CommandKey.PublishConfirm:
+                        PublishConfirm.Read(frame, out PublishConfirm confirm);
+                        ConfirmFrames += 1;
+                        var (confirmCallback, _) = publishers[confirm.PublisherId];
+                        confirmCallback(confirm.PublishingIds);
+                        if (MemoryMarshal.TryGetArray(confirm.PublishingIds, out ArraySegment<ulong> confirmSegment))
+                        {
+                            ArrayPool<ulong>.Shared.Return(confirmSegment.Array);
+                        }
+                        break;
+                    case CommandKey.PublishError:
+                        PublishError.Read(frame, out PublishError error);
+                        var (_, errorCallback) = publishers[error.PublisherId];
+                        errorCallback(error.PublishingErrors);
+                        break;
+                    case CommandKey.MetadataUpdate:
+                        MetaDataUpdate.Read(frame, out MetaDataUpdate metaDataUpdate);
+                        parameters.MetadataHandler(metaDataUpdate);
+                        break;
+                    case CommandKey.Tune:
+                        Tune.Read(frame, out Tune tuneResponse);
+                        tuneReceived.SetResult(tuneResponse);
+                        break;
+                    default:
+                        throw new ArgumentException($"Unknown or unexpected command: {command}", nameof(command));
+                }
+            }
+
+            return Task.CompletedTask;
+        }
+
+        private Task HandleResponse(CommandKey commandKey, ref ReadOnlyMemory<byte> frameMemory)
+        {
+            var frame = new ReadOnlySequence<byte>(frameMemory);
+            switch (commandKey)
+            {
+                case CommandKey.DeclarePublisher:
                     DeclarePublisherResponse.Read(frame, out var declarePublisherResponse);
                     HandleCorrelatedResponse(declarePublisherResponse);
                     break;
-                case QueryPublisherResponse.Key:
-                    QueryPublisherResponse.Read(frame, out var queryPublisherResponse);
+                case CommandKey.QueryPublisherSequence:
+                    QueryPublisherSequenceResponse.Read(frame, out var queryPublisherResponse);
                     HandleCorrelatedResponse(queryPublisherResponse);
                     break;
-                case DeletePublisherResponse.Key:
+                case CommandKey.DeletePublisher:
                     DeletePublisherResponse.Read(frame, out var deletePublisherResponse);
                     HandleCorrelatedResponse(deletePublisherResponse);
                     break;
-                case SubscribeResponse.Key:
+                case CommandKey.Subscribe:
                     SubscribeResponse.Read(frame, out var subscribeResponse);
                     HandleCorrelatedResponse(subscribeResponse);
                     break;
-                case QueryOffsetResponse.Key:
+                case CommandKey.QueryOffset:
                     QueryOffsetResponse.Read(frame, out var queryOffsetResponse);
                     HandleCorrelatedResponse(queryOffsetResponse);
                     break;
-                case UnsubscribeResponse.Key:
+                case CommandKey.Unsubscribe:
                     UnsubscribeResponse.Read(frame, out var unsubscribeResponse);
                     HandleCorrelatedResponse(unsubscribeResponse);
                     break;
-                case CreateResponse.Key:
+                case CommandKey.Create:
                     CreateResponse.Read(frame, out var createResponse);
                     HandleCorrelatedResponse(createResponse);
                     break;
-                case DeleteResponse.Key:
+                case CommandKey.Delete:
                     DeleteResponse.Read(frame, out var deleteResponse);
                     HandleCorrelatedResponse(deleteResponse);
                     break;
-                case MetaDataResponse.Key:
+                case CommandKey.Metadata:
                     MetaDataResponse.Read(frame, out var metaDataResponse);
                     HandleCorrelatedResponse(metaDataResponse);
                     break;
-                case PeerPropertiesResponse.Key:
+                case CommandKey.PeerProperties:
                     PeerPropertiesResponse.Read(frame, out var peerPropertiesResponse);
                     HandleCorrelatedResponse(peerPropertiesResponse);
                     break;
-                case SaslHandshakeResponse.Key:
+                case CommandKey.SaslHandshake:
                     SaslHandshakeResponse.Read(frame, out var saslHandshakeResponse);
                     HandleCorrelatedResponse(saslHandshakeResponse);
                     break;
-                case SaslAuthenticateResponse.Key:
+                case CommandKey.SaslAuthenticate:
                     SaslAuthenticateResponse.Read(frame, out var saslAuthenticateResponse);
                     HandleCorrelatedResponse(saslAuthenticateResponse);
                     break;
-                case OpenResponse.Key:
+                case CommandKey.Open:
                     OpenResponse.Read(frame, out var openResponse);
                     HandleCorrelatedResponse(openResponse);
                     break;
-                case CloseResponse.Key:
+                case CommandKey.Close:
                     CloseResponse.Read(frame, out var closeResponse);
                     HandleCorrelatedResponse(closeResponse);
                     break;
@@ -353,11 +316,13 @@ namespace RabbitMQ.Stream.Client
                         ArrayPool<byte>.Shared.Return(segment.Array);
                     }
 
-                    throw new ArgumentException($"Unknown or unexpected tag: {tag}", nameof(tag));
+                    throw new ArgumentException($"Unknown or unexpected command: {commandKey}", nameof(commandKey));
             }
+
+            return Task.CompletedTask;
         }
 
-        private void HandleCorrelatedResponse<T>(T command) where T : struct, ICommand
+        private void HandleCorrelatedResponse<T>(T command) where T : struct, ICommandResponse
         {
             if (command.CorrelationId == uint.MaxValue)
             {
@@ -384,14 +349,14 @@ namespace RabbitMQ.Stream.Client
             return result;
         }
 
-        public async ValueTask<QueryPublisherResponse> QueryPublisherSequence(string publisherRef, string stream)
+        public async ValueTask<QueryPublisherSequenceResponse> QueryPublisherSequence(string publisherRef, string stream)
         {
-            return await Request<QueryPublisherRequest, QueryPublisherResponse>(corr => new QueryPublisherRequest(corr, publisherRef, stream));
+            return await Request<QueryPublisherSequenceRequest, QueryPublisherSequenceResponse>(corr => new QueryPublisherSequenceRequest(corr, publisherRef, stream));
         }
 
         public async ValueTask<bool> StoreOffset(string reference, string stream, ulong offsetValue)
         {
-            return await Publish(new StoreOffsetRequest(stream, reference, offsetValue));
+            return await Publish(new StoreOffset(stream, reference, offsetValue));
         }
 
         public async ValueTask<MetaDataResponse> QueryMetadata(string[] streams)
@@ -404,7 +369,7 @@ namespace RabbitMQ.Stream.Client
             return await Request<QueryOffsetRequest, QueryOffsetResponse>(corr => new QueryOffsetRequest(stream, corr, reference));
         }
 
-        public async ValueTask<CreateResponse> CreateStream(string stream, IDictionary<string, string> args)
+        public async ValueTask<CreateResponse> CreateStream(string stream, Dictionary<string, string> args)
         {
             return await Request<CreateRequest, CreateResponse>(corr => new CreateRequest(corr, stream, args));
         }
@@ -416,7 +381,7 @@ namespace RabbitMQ.Stream.Client
 
         public async ValueTask<bool> Credit(byte subscriptionId, ushort credit)
         {
-            return await Publish(new CreditRequest(subscriptionId, credit));
+            return await Publish(new Credit(subscriptionId, credit));
         }
     }
 
